@@ -8,13 +8,13 @@ from threading import Thread
 from typing import Dict, Set
 
 import mapadroid.plugins.pluginBase
+# from plugins.poraclePvpHelper.endpoints import register_custom_plugin_endpoints
 import requests
 from aiohttp import web
 from mapadroid.db.DbWebhookReader import DbWebhookReader
 from mapadroid.utils.RestHelper import RestApiResult, RestHelper
 from mapadroid.utils.json_encoder import mad_json_dumps
 from mapadroid.utils.madGlobals import MonSeenTypes
-from plugins.poraclePvpHelper.endpoints import register_custom_plugin_endpoints
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "PogoPvpData"))
 from pogopvpdata import PokemonData  # noqa: E402
@@ -79,7 +79,7 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
         ]
 
         if self._pluginconfig.getboolean("plugin", "active", fallback=False):
-            register_custom_plugin_endpoints(self._plugin_subapp)
+            # register_custom_plugin_endpoints(self._plugin_subapp)
 
             for name, link, description in self._hotlink:
                 self._mad_parts['madmin'].add_plugin_hotlink(name, link.replace("/", ""),
