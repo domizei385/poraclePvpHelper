@@ -1,63 +1,50 @@
-import mapadroid.utils.pluginBase
-from flask import render_template, Blueprint
-from mapadroid.madmin.functions import auth_required
+import asyncio
+import configparser
 import os
+import pickle
 import sys
 import time
-import json
-import logging
 from threading import Thread
-import pickle
+from typing import Dict, Set
+
+import mapadroid.plugins.pluginBase
 import requests
-import configparser
-from mapadroid.utils.logging import get_logger, LoggerEnums, get_bind_name
+from aiohttp import web
+from mapadroid.db.DbWebhookReader import DbWebhookReader
+from mapadroid.utils.RestHelper import RestApiResult, RestHelper
+from mapadroid.utils.json_encoder import mad_json_dumps
+from mapadroid.utils.madGlobals import MonSeenTypes
+from plugins.poraclePvpHelper.endpoints import register_custom_plugin_endpoints
+
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "PogoPvpData"))
 from pogopvpdata import PokemonData  # noqa: E402
 
 
-logger = get_logger(LoggerEnums.plugin)
-
-
-class PoracleInterceptHandler(logging.Handler):
-    def __init__(self, *args, **kwargs):
-        try:
-            self.log_section = kwargs['log_section']
-            del kwargs['log_section']
-        except KeyError:
-            self.log_section = LoggerEnums.unknown
-        try:
-            self.log_identifier = kwargs['log_identifier']
-            del kwargs['log_identifier']
-        except KeyError:
-            self.log_identifier = LoggerEnums.unknown
-        super().__init__(*args, **kwargs)
-        self.log_identifier = get_bind_name(self.log_section, self.log_identifier)
-
-    def emit(self, record):
-        with logger.contextualize(name=self.log_identifier):
-            logger.opt(depth=6, exception=record.exc_info).log(record.levelname, record.getMessage())
-
-
-logging.getLogger('pogopvpdata').setLevel(logging.INFO)
-logging.getLogger('pogopvpdata').addHandler(PoracleInterceptHandler())
-
-
-class poraclePvpHelper(mapadroid.utils.pluginBase.Plugin):
+class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
     """poraclePvpHelper plugin
     """
-    def __init__(self, mad):
-        super().__init__(mad)
+
+    def _file_path(self) -> str:
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def __init__(self, subapp_to_register_to: web.Application, mad_parts: Dict):
+        super().__init__(subapp_to_register_to, mad_parts)
 
         self._rootdir = os.path.dirname(os.path.abspath(__file__))
-        sys.path.append(self._rootdir)
+        self._mad = self._mad_parts
+        self.logger = self._mad['logger']
+        self.__db_wrapper = self._mad["db_wrapper"]
+        self.__webhook_worker = self._mad["webhook_worker"]
 
-        self._mad = mad
-        self.db = self._mad["db_wrapper"]
-        self.logger = get_logger(LoggerEnums.plugin)
-        self.wh = self._mad["webhook_worker"]
+        statusname = self._mad["args"].status_name
+        self.logger.info("Got statusname: {}", statusname)
+        if os.path.isfile(self._rootdir + "/plugin-" + statusname + ".ini"):
+            self._pluginconfig.read(self._rootdir + "/plugin-" + statusname + ".ini")
+            self.logger.info("loading instance-specific config for {}", statusname)
+        else:
+            self._pluginconfig.read(self._rootdir + "/plugin.ini")
+            self.logger.info("loading standard plugin.ini")
 
-        self.statusname = self._mad["args"].status_name
-        self._pluginconfig.read(self._rootdir + "/plugin.ini")
         self._versionconfig.read(self._rootdir + "/version.mpl")
         self.author = self._versionconfig.get("plugin", "author", fallback="unknown")
         self.url = self._versionconfig.get("plugin", "url", fallback="https://www.maddev.eu")
@@ -68,47 +55,40 @@ class poraclePvpHelper(mapadroid.utils.pluginBase.Plugin):
         self.templatepath = self._rootdir + "/template/"
 
         # plugin specific
-        if self.statusname in self._pluginconfig:
-            self.logger.success("Applying specific config for status-name {}!", self.statusname)
-            settings = self.statusname
-        else:
-            self.logger.info("Using generic settings on instance with status-name {}", self.statusname)
-            settings = "settings"
-        self.target = self._pluginconfig.get(settings, "target", fallback=None)
-        self.interval = self._pluginconfig.getint(settings, "interval", fallback=30)
-        self.ranklength = self._pluginconfig.getint(settings, "ranklength", fallback=100)
-        self.maxlevel = self._pluginconfig.getint(settings, "maxlevel", fallback=50)
-        self.precalc = self._pluginconfig.getboolean(settings, "precalc", fallback=False)
-        self.saveData = self._pluginconfig.getboolean(settings, "savedata", fallback=True)
-        self.encid_string = self._pluginconfig.getboolean(settings, "encidstring", fallback=True)
+        if not statusname in self._pluginconfig:
+            self.logger.info("Using generic settings on instance with status-name {}", statusname)
+            statusname = "settings"
 
-        self._routes = [
-            ("/poraclePvpHelper_manual", self.manual),
-        ]
+        self.target = self._pluginconfig.get(statusname, "target", fallback=None)
+        self.interval = self._pluginconfig.getint(statusname, "interval", fallback=30)
+        self.ranklength = self._pluginconfig.getint(statusname, "ranklength", fallback=100)
+        self.maxlevel = self._pluginconfig.getint(statusname, "maxlevel", fallback=50)
+        self.precalc = self._pluginconfig.getboolean(statusname, "precalc", fallback=False)
+        self.saveData = self._pluginconfig.getboolean(statusname, "savedata", fallback=True)
+        self.encid_string = self._pluginconfig.getboolean(statusname, "encidstring", fallback=True)
 
+        self.__webhook_receivers = []
+        self.__pokemon_types: Set[MonSeenTypes] = set()
+        self.__valid_mon_types: Set[MonSeenTypes] = {
+            MonSeenTypes.encounter, MonSeenTypes.wild, MonSeenTypes.lure_wild, MonSeenTypes.lure_encounter
+        }
+
+        # linking pages
         self._hotlink = [
-            ("poraclePvpHelper Manual", "poraclePvpHelper_manual", "poraclePvpHelper Manual"),
+            ("poraclePvpHelper Manual", "poraclepvphelper_manual", "poraclePvpHelper Manual"),
         ]
 
         if self._pluginconfig.getboolean("plugin", "active", fallback=False):
-            self._plugin = Blueprint(str(self.pluginname), __name__, static_folder=self.staticpath,
-                                     template_folder=self.templatepath)
-
-            for route, view_func in self._routes:
-                self._plugin.add_url_rule(route, route.replace("/", ""), view_func=view_func)
+            register_custom_plugin_endpoints(self._plugin_subapp)
 
             for name, link, description in self._hotlink:
-                self._mad['madmin'].add_plugin_hotlink(name, self._plugin.name + "." + link.replace("/", ""),
-                                                       self.pluginname, self.description, self.author, self.url,
-                                                       description, self.version)
+                self._mad_parts['madmin'].add_plugin_hotlink(name, link.replace("/", ""),
+                                                             self.pluginname, self.description, self.author, self.url,
+                                                             description, self.version)
 
-    def perform_operation(self):
-        # do not change this part ▽▽▽▽▽▽▽▽▽▽▽▽▽▽▽
+    async def _perform_operation(self):
         if not self._pluginconfig.getboolean("plugin", "active", fallback=False):
             return False
-        self._mad['madmin'].register_plugin(self._plugin)
-        # do not change this part △△△△△△△△△△△△△△△
-
         if not self._mad["args"].webhook:
             self.logger.error("Webhook worker is required but not enabled. Please set 'webhook' in your config "
                               "and restart. Stopping the plugin.")
@@ -116,11 +96,11 @@ class poraclePvpHelper(mapadroid.utils.pluginBase.Plugin):
 
         # load your stuff now
         self.logger.success("poraclePvpHelper Plugin starting operations ...")
-        poraclePvpHelper = Thread(name="poraclePvpHelper", target=self.poraclePvpHelper,)
-        poraclePvpHelper.daemon = True
-        poraclePvpHelper.start()
+        self.__build_webhook_receivers()
+        loop = asyncio.get_running_loop()
+        self._thread_poraclePvpHelper = loop.create_task(self.poraclePvpHelper())
 
-        updateChecker = Thread(name="poraclePvpHelperUpdates", target=self.update_checker,)
+        updateChecker = Thread(name="poraclePvpHelperUpdates", target=self.update_checker, )
         updateChecker.daemon = True
         updateChecker.start()
 
@@ -185,68 +165,106 @@ class poraclePvpHelper(mapadroid.utils.pluginBase.Plugin):
             time.sleep(3600)
 
     # copied from mapadroid/webhook/webhookworker.py
+    def __build_webhook_receivers(self):
+        webhooks = self.target.replace(" ", "").split(",")
+
+        for webhook in webhooks:
+            sub_types = None
+            url = webhook.strip()
+
+            if url.startswith("["):
+                end_pos = url.index("]")
+                raw_sub_types = url[1:end_pos].strip()
+                url = url[end_pos + 1:]
+                sub_types = raw_sub_types.split(" ")
+                sub_types = [t.replace(" ", "") for t in sub_types]
+
+                if "pokemon" in sub_types:
+                    sub_types.append("encounter")
+
+                for vmtype in self.__valid_mon_types:
+                    if vmtype.name in sub_types:
+                        self.__pokemon_types.add(vmtype)
+            else:
+                for valid_mon_type in self.__valid_mon_types:
+                    self.__pokemon_types.add(valid_mon_type)
+
+            self.__webhook_receivers.append({
+                "url": url.replace(" ", ""),
+                "types": sub_types
+            })
+
+    # copied from mapadroid/webhook/webhookworker.py
     def _payload_chunk(self, payload, size):
         if size == 0:
             return [payload]
 
         return [payload[x: x + size] for x in range(0, len(payload), size)]
 
+    # copied from mapadroid/webhook/webhookworker.py
+    def __payload_type_count(self, payload):
+        count = {}
+
+        for elem in payload:
+            count[elem["type"]] = count.get(elem["type"], 0) + 1
+
+        return count
+
+    # copied from mapadroid/webhook/webhookworker.py
+    def __payload_chunk(self, payload, size):
+        if size == 0:
+            return [payload]
+
+        return [payload[x: x + size] for x in range(0, len(payload), size)]
+
     # copied from mapadroid/webhook/webhookworker.py + some variables adjusted
-    def _send_webhook(self, payloads):
+    async def _send_webhook(self, payloads):
         if len(payloads) == 0:
             self.logger.debug2("Payload empty. Skip sending to webhook.")
             return
 
-        # get list of urls
-        webhooks = self.target.replace(" ", "").split(",")
+        if len(payloads) == 0:
+            self.logger.debug2("Payload empty. Skip sending to webhook.")
+            return
 
-        webhook_count = len(webhooks)
         current_wh_num = 1
-
-        for webhook in webhooks:
+        for webhook in self.__webhook_receivers:
             payload_to_send = []
-            sub_types = "all"
-            url = webhook.strip()
+            sub_types = webhook.get('types')
 
-            if url.startswith("["):
-                end_index = webhook.rindex("]")
-                end_index += 1
-                sub_types = webhook[:end_index]
-                url = url[end_index:]
-
+            if sub_types is not None:
                 for payload in payloads:
-                    if payload["type"] in sub_types:
+                    if payload["type"] in sub_types or \
+                        (payload["message"].get("seen_type", None) in sub_types):
                         payload_to_send.append(payload)
             else:
                 payload_to_send = payloads
 
             if len(payload_to_send) == 0:
-                self.logger.debug2("Payload empty. Skip sending to: {} (Filter: {})", url, sub_types)
+                self.logger.debug2("Payload empty. Skip sending to: {} (Filter: {})", webhook.get('url'), sub_types)
                 continue
             else:
-                self.logger.debug2("Sending to webhook url: {} (Filter: {})", url, sub_types)
+                self.logger.debug2("Sending to webhook: {} (Filter: {})", webhook.get('url'), sub_types)
 
-            payload_list = self._payload_chunk(payloads, self._mad["args"].webhook_max_payload_size)
+            payload_list = self.__payload_chunk(payload_to_send, 100)
 
             current_pl_num = 1
             for payload_chunk in payload_list:
                 self.logger.debug4("Python data for payload: {}", payload_chunk)
-                self.logger.debug4("Payload: {}", json.dumps(payload_chunk))
+                self.logger.debug4("Payload: {}", await mad_json_dumps(payload_chunk))
 
                 try:
-                    response = requests.post(
-                        url,
-                        data=json.dumps(payload_chunk),
-                        headers={"Content-Type": "application/json"},
-                        timeout=5,
-                    )
-
+                    response: RestApiResult = await RestHelper.send_post(webhook.get('url'),
+                                                                         data=payload_chunk,
+                                                                         headers={"Content-Type": "application/json"},
+                                                                         params=None,
+                                                                         timeout=5)
                     if response.status_code != 200:
-                        self.logger.warning("Got status code other than 200 OK from webhook destination: {}",
-                                            response.status_code)
+                        self.logger.warning("Webhook destination {} returned status code other than 200 OK: {}",
+                                       webhook.get('url'), response.status_code)
                     else:
-                        if webhook_count > 1:
-                            whcount_text = " [wh {}/{}]".format(current_wh_num, webhook_count)
+                        if len(self.__webhook_receivers) > 1:
+                            whcount_text = " [wh {}/{}]".format(current_wh_num, len(self.__webhook_receivers))
                         else:
                             whcount_text = ""
 
@@ -255,19 +273,19 @@ class poraclePvpHelper(mapadroid.utils.pluginBase.Plugin):
                         else:
                             whchunk_text = ""
 
-                        self.logger.success("Successfully sent poraclePvpHelper data to webhook{}{}. Mons sent: {}",
-                                            whchunk_text, whcount_text, len(payload_chunk))
+                        self.logger.success("Successfully sent payload to webhook{}{}. Stats: {}", whchunk_text,
+                                       whcount_text, await mad_json_dumps(self.__payload_type_count(payload_chunk)))
                 except Exception as e:
-                    self.logger.warning("Exception occured while sending webhook: {}", e)
+                    self.logger.warning("Exception occurred while sending webhook: {}", e)
 
                 current_pl_num += 1
             current_wh_num += 1
 
-    def poraclePvpHelper(self):
+    async def poraclePvpHelper(self):
         self.__last_check = int(time.time())
         if not self.target:
             self.logger.error("no webhook (target) defined in settings - what am I doing here? ;)")
-            return False
+            return
 
         if os.path.isfile("{}/data.pickle".format(self._rootdir)):
             os.rename("{}/data.pickle".format(self._rootdir), "{}/.data.pickle".format(self._rootdir))
@@ -288,50 +306,51 @@ class poraclePvpHelper(mapadroid.utils.pluginBase.Plugin):
 
         if not data:
             self.logger.error("Failed aquiring PokemonData object! Stopping the plugin.")
-            return False
+            return
 
-        self.logger.success("PokemonData object aquired")
+        self.logger.success("PokemonData object acquired")
 
         w = 0
-        while not self.wh and w < 12:
+        while not self.__webhook_worker and w < 12:
             w += 1
             self.logger.warning("waiting for the webhook worker to be initialized ...")
             time.sleep(10)
         if w > 11:
             self.logger.error("Failed trying to access the webhook worker with webhook enabled. Please contact "
                               "the developer.")
-            return False
+            return
 
         while True:
+            starttime = int(time.time())
             try:
-                starttime = int(time.time())
-                monsFromDb = self.db.webhook_reader.get_mon_changed_since(self.__last_check)
-                payload = self.wh._WebhookWorker__prepare_mon_data(monsFromDb)
-                for mon in payload:
-                    if "individual_attack" in mon["message"]:
-                        content = mon["message"]
-                        if self.encid_string:
-                            content["encounter_id"] = str(content["encounter_id"])
-                        try:
-                            form = content["form"]
-                        except Exception:
-                            form = 0
-                        try:
-                            great, ultra = data.getPoraclePvpInfo(content["pokemon_id"], form,
-                                                                  content["individual_attack"],
-                                                                  content["individual_defense"],
-                                                                  content["individual_stamina"],
-                                                                  content["pokemon_level"],
-                                                                  content["gender"])
-                        except Exception as e:
-                            self.logger.warning("Failed processing mon #{}-{}. Skipping. Error: {}",
-                                                content["pokemon_id"], form, e)
-                            continue
-                        if len(great) > 0:
-                            mon["message"]["pvp_rankings_great_league"] = great
-                        if len(ultra) > 0:
-                            mon["message"]["pvp_rankings_ultra_league"] = ultra
-                self._send_webhook(payload)
+                async with self.__db_wrapper as session, session:
+                    mons_from_db = await DbWebhookReader.get_mon_changed_since(session, self.__last_check, self.__pokemon_types)
+                    payload = self.__webhook_worker._WebhookWorker__prepare_mon_data(mons_from_db)
+                    for mon in payload:
+                        if "individual_attack" in mon["message"]:
+                            content = mon["message"]
+                            if self.encid_string:
+                                content["encounter_id"] = str(content["encounter_id"])
+                            try:
+                                form = content["form"]
+                            except Exception:
+                                form = 0
+                            try:
+                                great, ultra = data.getPoraclePvpInfo(content["pokemon_id"], form,
+                                                                      content["individual_attack"],
+                                                                      content["individual_defense"],
+                                                                      content["individual_stamina"],
+                                                                      content["pokemon_level"],
+                                                                      content["gender"])
+                            except Exception as e:
+                                self.logger.warning("Failed processing mon #{}-{}. Skipping. Error: {}",
+                                                    content["pokemon_id"], form, e)
+                                continue
+                            if len(great) > 0:
+                                mon["message"]["pvp_rankings_great_league"] = great
+                            if len(ultra) > 0:
+                                mon["message"]["pvp_rankings_ultra_league"] = ultra
+                await self._send_webhook(payload)
 
                 if self.saveData and data.is_changed():
                     self._pickle_data(data)
@@ -341,10 +360,4 @@ class poraclePvpHelper(mapadroid.utils.pluginBase.Plugin):
                 self.logger.opt(exception=True).error("Unhandled exception in poraclePvpHelper! Trying to continue... "
                                                       "Please notify the developer!")
             self.__last_check = starttime
-            time.sleep(self.interval)
-
-    @auth_required
-    def manual(self):
-        return render_template("poraclePvpHelper_manual.html",
-                               header="poraclePvpHelper manual", title="poraclePvpHelper manual"
-                               )
+            await asyncio.sleep(self.interval)
