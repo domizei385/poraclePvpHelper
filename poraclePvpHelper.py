@@ -8,7 +8,7 @@ from threading import Thread
 from typing import Dict, Set
 
 import mapadroid.plugins.pluginBase
-# from plugins.poraclePvpHelper.endpoints import register_custom_plugin_endpoints
+from plugins.poraclePvpHelper.endpoints import register_custom_plugin_endpoints
 import requests
 from aiohttp import web
 from mapadroid.db.DbWebhookReader import DbWebhookReader
@@ -79,7 +79,7 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
         ]
 
         if self._pluginconfig.getboolean("plugin", "active", fallback=False):
-            # register_custom_plugin_endpoints(self._plugin_subapp)
+            register_custom_plugin_endpoints(self._plugin_subapp)
 
             for name, link, description in self._hotlink:
                 self._mad_parts['madmin'].add_plugin_hotlink(name, link.replace("/", ""),
@@ -223,10 +223,6 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
             self.logger.debug2("Payload empty. Skip sending to webhook.")
             return
 
-        if len(payloads) == 0:
-            self.logger.debug2("Payload empty. Skip sending to webhook.")
-            return
-
         current_wh_num = 1
         for webhook in self.__webhook_receivers:
             payload_to_send = []
@@ -314,7 +310,7 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
         while not self.__webhook_worker and w < 12:
             w += 1
             self.logger.warning("waiting for the webhook worker to be initialized ...")
-            time.sleep(10)
+            await asyncio.sleep(10)
         if w > 11:
             self.logger.error("Failed trying to access the webhook worker with webhook enabled. Please contact "
                               "the developer.")
