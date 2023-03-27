@@ -70,7 +70,7 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
         self.__webhook_receivers = []
         self.__pokemon_types: Set[MonSeenTypes] = set()
         self.__valid_mon_types: Set[MonSeenTypes] = {
-            MonSeenTypes.encounter, MonSeenTypes.wild, MonSeenTypes.lure_wild, MonSeenTypes.lure_encounter
+            MonSeenTypes.encounter, MonSeenTypes.wild, MonSeenTypes.lure_encounter
         }
 
         # linking pages
