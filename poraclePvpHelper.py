@@ -60,13 +60,14 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
             statusname = "settings"
 
         self.target = self._pluginconfig.get(statusname, "target", fallback=None)
-        self.interval = self._pluginconfig.getint(statusname, "interval", fallback=30)
+        self.__worker_interval_sec = self._pluginconfig.getint(statusname, "interval", fallback=30)
         self.ranklength = self._pluginconfig.getint(statusname, "ranklength", fallback=100)
         self.maxlevel = self._pluginconfig.getint(statusname, "maxlevel", fallback=50)
         self.precalc = self._pluginconfig.getboolean(statusname, "precalc", fallback=False)
         self.saveData = self._pluginconfig.getboolean(statusname, "savedata", fallback=True)
         self.encid_string = self._pluginconfig.getboolean(statusname, "encidstring", fallback=True)
 
+        self.__last_check = int(time.time())
         self.__webhook_receivers = []
         self.__pokemon_types: Set[MonSeenTypes] = set()
         self.__valid_mon_types: Set[MonSeenTypes] = {
@@ -195,14 +196,16 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
             })
 
     # copied from mapadroid/webhook/webhookworker.py
-    def _payload_chunk(self, payload, size):
+    @staticmethod
+    def _payload_chunk(payload, size):
         if size == 0:
             return [payload]
 
         return [payload[x: x + size] for x in range(0, len(payload), size)]
 
     # copied from mapadroid/webhook/webhookworker.py
-    def __payload_type_count(self, payload):
+    @staticmethod
+    def __payload_type_count(payload):
         count = {}
 
         for elem in payload:
@@ -210,15 +213,8 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
 
         return count
 
-    # copied from mapadroid/webhook/webhookworker.py
-    def __payload_chunk(self, payload, size):
-        if size == 0:
-            return [payload]
-
-        return [payload[x: x + size] for x in range(0, len(payload), size)]
-
     # copied from mapadroid/webhook/webhookworker.py + some variables adjusted
-    async def _send_webhook(self, payloads):
+    async def __send_webhook(self, payloads):
         if len(payloads) == 0:
             self.logger.debug2("Payload empty. Skip sending to webhook.")
             return
@@ -277,49 +273,13 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
                 current_pl_num += 1
             current_wh_num += 1
 
-    async def poraclePvpHelper(self):
-        self.__last_check = int(time.time())
-        if not self.target:
-            self.logger.error("no webhook (target) defined in settings - what am I doing here? ;)")
-            return
+    async def __create_payload(self, data: PokemonData):
+        self.logger.debug("Fetching data changed since {}", self.__last_check)
 
-        if os.path.isfile("{}/data.pickle".format(self._rootdir)):
-            os.rename("{}/data.pickle".format(self._rootdir), "{}/.data.pickle".format(self._rootdir))
-            self.logger.success("migrated data.pickle to .data.pickle (hidden file)")
-
-        try:
-            with open("{}/.data.pickle".format(self._rootdir), "rb") as datafile:
-                data = pickle.load(datafile)
-        except Exception as e:
-            self.logger.debug("exception trying to load pickle'd data: {}".format(e))
-            add_string = " - start initialization" if self.precalc else " - will calculate as needed"
-            self.logger.warning(f"Failed loading previously calculated data{add_string}")
-            data = None
-
-        if not data:
-            data = PokemonData(self.ranklength, self.maxlevel, precalc=self.precalc)
-            self._pickle_data(data)
-
-        if not data:
-            self.logger.error("Failed aquiring PokemonData object! Stopping the plugin.")
-            return
-
-        self.logger.success("PokemonData object acquired")
-
-        w = 0
-        while not self.__webhook_worker and w < 12:
-            w += 1
-            self.logger.warning("waiting for the webhook worker to be initialized ...")
-            await asyncio.sleep(10)
-        if w > 11:
-            self.logger.error("Failed trying to access the webhook worker with webhook enabled. Please contact "
-                              "the developer.")
-            return
-
-        while True:
-            starttime = int(time.time())
+        payload = []
+        async with self.__db_wrapper as session, session:
             try:
-                async with self.__db_wrapper as session, session:
+                if self.__pokemon_types:
                     mons_from_db = await DbWebhookReader.get_mon_changed_since(session, self.__last_check, self.__pokemon_types)
                     payload = self.__webhook_worker._WebhookWorker__prepare_mon_data(mons_from_db)
                     for mon in payload:
@@ -346,14 +306,66 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
                                 mon["message"]["pvp_rankings_great_league"] = great
                             if len(ultra) > 0:
                                 mon["message"]["pvp_rankings_ultra_league"] = ultra
-                await self._send_webhook(payload)
-
-                if self.saveData and data.is_changed():
-                    self._pickle_data(data)
-                    data.saved()
-
             except Exception:
-                self.logger.opt(exception=True).error("Unhandled exception in poraclePvpHelper! Trying to continue... "
-                                                      "Please notify the developer!")
-            self.__last_check = starttime
-            await asyncio.sleep(self.interval)
+                self.logger.opt(exception=True).error("Unhandled exception in poraclePvpHelper! Trying to continue... ")
+
+        self.logger.debug("Done fetching data + building payload")
+
+        return payload
+
+    async def poraclePvpHelper(self):
+        self.__last_check = int(time.time())
+        if not self.target:
+            self.logger.error("no webhook (target) defined in settings - what am I doing here? ;)")
+            return
+
+        if os.path.isfile("{}/data.pickle".format(self._rootdir)):
+            os.rename("{}/data.pickle".format(self._rootdir), "{}/.data.pickle".format(self._rootdir))
+            self.logger.success("migrated data.pickle to .data.pickle (hidden file)")
+
+        try:
+            with open("{}/.data.pickle".format(self._rootdir), "rb") as datafile:
+                data = pickle.load(datafile)
+        except Exception as e:
+            self.logger.debug("exception trying to load pickle'd data: {}".format(e))
+            add_string = " - start initialization" if self.precalc else " - will calculate as needed"
+            self.logger.warning(f"Failed loading previously calculated data{add_string}")
+            data = None
+
+        if not data:
+            data = PokemonData(self.ranklength, self.maxlevel, precalc=self.precalc)
+            self._pickle_data(data)
+
+        if not data:
+            self.logger.error("Failed acquiring PokemonData object! Stopping the plugin.")
+            return
+
+        self.logger.success("PokemonData object acquired")
+
+        w = 0
+        while not self.__webhook_worker and w < 12:
+            w += 1
+            self.logger.warning("waiting for the webhook worker to be initialized ...")
+            await asyncio.sleep(10)
+        if w > 11:
+            self.logger.error("Failed trying to access the webhook worker with webhook enabled. Please contact "
+                              "the developer.")
+            return
+
+        while True:
+            # Always check modifications of intervals N - 6 to NOW given processing of queues may take some time...
+            preparing_timestamp = int(time.time()) - 6 * self.__worker_interval_sec
+
+            # fetch data and create payload
+            full_payload = await self.__create_payload(data)
+
+            # send our payload
+            await self.__send_webhook(full_payload)
+
+            self.__last_check = preparing_timestamp
+
+            if self.saveData and data.is_changed():
+                self._pickle_data(data)
+                data.saved()
+
+            await asyncio.sleep(self.__worker_interval_sec)
