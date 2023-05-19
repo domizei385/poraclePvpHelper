@@ -196,16 +196,14 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
             })
 
     # copied from mapadroid/webhook/webhookworker.py
-    @staticmethod
-    def _payload_chunk(payload, size):
+    def __payload_chunk(self, payload, size):
         if size == 0:
             return [payload]
 
         return [payload[x: x + size] for x in range(0, len(payload), size)]
 
     # copied from mapadroid/webhook/webhookworker.py
-    @staticmethod
-    def __payload_type_count(payload):
+    def __payload_type_count(self, payload):
         count = {}
 
         for elem in payload:
