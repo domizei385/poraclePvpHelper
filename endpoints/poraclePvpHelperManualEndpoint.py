@@ -2,13 +2,13 @@ from mapadroid.plugins.endpoints.AbstractPluginEndpoint import AbstractPluginEnd
 import aiohttp_jinja2
 
 
-class accountServerManualEndpoint(AbstractPluginEndpoint):
+class poraclePvpHelperManualEndpoint(AbstractPluginEndpoint):
     """
-    "/accountserver_manual"
+    "/poraclepvphelper_manual"
     """
 
     # TODO: Auth
-    @aiohttp_jinja2.template('accountserver_manual.html')
+    @aiohttp_jinja2.template('poraclePvpHelper_manual.html')
     async def get(self):
-        return {"header": "accountServerConnector Manual",
-                "title": "accountServerConnector Manual"}
+        return {"header": "poraclePvpHelper Manual",
+                "title": "poraclePvpHelper Manual"}

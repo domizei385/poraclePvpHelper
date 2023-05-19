@@ -76,7 +76,7 @@ class poraclePvpHelper(mapadroid.plugins.pluginBase.Plugin):
 
         # linking pages
         self._hotlink = [
-            ("poraclePvpHelper Manual", "poraclepvphelper_manual", "poraclePvpHelper Manual"),
+            ("poraclePvpHelper Manual", "poraclePvpHelper_manual", "poraclePvpHelper Manual"),
         ]
 
         if self._pluginconfig.getboolean("plugin", "active", fallback=False):
